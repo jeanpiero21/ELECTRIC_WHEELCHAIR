@@ -3,7 +3,7 @@
 
 import math
 import time
-from time import sleep
+import json
 import threading
 import serial
 from math import sqrt
@@ -17,269 +17,516 @@ from mbientlab.metawear import (
     GyroBoschRange,
     GyroBoschOdr
 )
-from mbientlab.metawear.cbindings import FnVoid_VoidP_DataP
+from mbientlab.metawear.cbindings import FnVoid_VoidP_DataP, LedPattern, LedColor
 from mbientlab.warble import WarbleException
+from ctypes import c_ubyte, c_ushort
 
 # ==========================
 #  Parámetros de operación
 # ==========================
-SENSOR_MAC = "C3:A9:C3:20:4A:9B"   # <-- cambia si hace falta
-SERIAL_PORT = "/dev/ttyACM0"
+SENSOR_MAC = "C3:A9:C3:20:4A:9B"
+SERIAL_PORTS = ['/dev/ttyACM0', '/dev/ttyACM1', '/dev/ttyUSB0', '/dev/ttyUSB1']
 BAUD = 115200
 
-DT_MS    = 10       # periodo del filtro en ms (modificable)
-ALPHA    = 0.98     # alpha fijo del complementario (modificable)
-PRINT_MS = 500      # intervalo de impresión en consola (ms)
-
-SEND_UART = True    # enviamos por UART al Arduino (cada DT_MS)
+ALPHA = 0.98     # alpha fijo del complementario
 
 # ==========================
-#  Serial (UART) a Arduino
+#  Serial (UART) a Arduino - Bidireccional CON DETECCIÓN AUTOMÁTICA
 # ==========================
-try:
-    arduino_serial = serial.Serial(SERIAL_PORT, BAUD, timeout=1)
-    print(f"UART OK en {SERIAL_PORT} @{BAUD}")
-except Exception as e:
-    print(f"[UART] Error abriendo puerto: {e}")
-    arduino_serial = None
+arduino_serial = None
+for port in SERIAL_PORTS:
+    try:
+        arduino_serial = serial.Serial(port, BAUD, timeout=0.1)
+        arduino_serial.flushInput()
+        arduino_serial.flushOutput()
+        print(f"✅ UART OK en {port} @{BAUD}")
+        break
+    except Exception as e:
+        print(f"❌ No se pudo abrir {port}: {e}")
+        continue
 
-def uart_send(line: str):
-    if SEND_UART and arduino_serial:
-        try:
-            arduino_serial.write((line + "\n").encode())
-        except Exception as e:
-            print("[UART] Error TX:", e)
+if arduino_serial is None:
+    print("⚠️  No se pudo conectar con Arduino, funcionando en modo solo IMU")
 
-# ==========================================
-#  Buffers compartidos (acc/gyro remapeados)
-# ==========================================
-latest_acc  = {"x": 0.0, "y": 0.0, "z": 0.0}   # g
+# ==========================
+#  Buffers compartidos y telemetría
+# ==========================
+latest_acc = {"x": 0.0, "y": 0.0, "z": 0.0}   # g
 latest_gyro = {"x": 0.0, "y": 0.0, "z": 0.0}   # dps
+latest_telemetry = {}  # Datos recibidos del Arduino
 _data_lock = threading.Lock()
+_telemetry_lock = threading.Lock()
 _have_first_samples = threading.Event()
+sensor_data_received = False
 
 # ==========================
-#  Filtro complementario (método clásico)
+#  Control de LEDs
 # ==========================
-class ComplementaryFilterClassic:
-    """
-    Convención de ejes (silla/persona):
-      X: hacia el frente
-      Y: hacia la izquierda
-      Z: hacia arriba
+def crear_patron_solido(duracion_ms=1000, intensidad=31, repeticiones=255):
+    """Crea un patron LED solido"""
+    patron = LedPattern()
+    patron.high_intensity = c_ubyte(intensidad)
+    patron.low_intensity = c_ubyte(0)
+    patron.rise_time_ms = c_ushort(0)
+    patron.high_time_ms = c_ushort(duracion_ms)
+    patron.fall_time_ms = c_ushort(0)
+    patron.pulse_duration_ms = c_ushort(duracion_ms)
+    patron.delay_time_ms = c_ushort(0)
+    patron.repeat_count = c_ubyte(repeticiones)
+    return patron
 
-    Definición de ángulos:
-      - roll  : rotación alrededor de X (tumbarse a los lados)
-      - pitch : rotación alrededor de Y (cabeceo)
+def crear_patron_parpadeo(periodo_ms=1000, intensidad=31):
+    """Crea un patrón de parpadeo"""
+    patron = LedPattern()
+    patron.high_intensity = c_ubyte(intensidad)
+    patron.low_intensity = c_ubyte(0)
+    patron.rise_time_ms = c_ushort(0)
+    patron.high_time_ms = c_ushort(periodo_ms // 2)
+    patron.fall_time_ms = c_ushort(0)
+    patron.pulse_duration_ms = c_ushort(periodo_ms)
+    patron.delay_time_ms = c_ushort(0)
+    patron.repeat_count = c_ubyte(255)
+    return patron
 
-    Método clásico (solo acelerómetro):
-      roll_acc  = atan(  ay / sqrt(ax^2 + az^2) )
-      pitch_acc = atan( -ax / sqrt(ay^2 + az^2) )
-    """
+def prender_led_verde(device):
+    """Prende LED verde - Conexión exitosa"""
+    try:
+        patron = crear_patron_solido(2000, 31, 1)
+        libmetawear.mbl_mw_led_write_pattern(device.board, patron, LedColor.GREEN)
+        libmetawear.mbl_mw_led_play(device.board)
+        print("🟢 LED verde ENCENDIDO - Conexión exitosa")
+    except Exception as e:
+        print(f"Error LED verde: {e}")
+
+def prender_led_azul(device):
+    """Prende LED azul - Calculando offset"""
+    try:
+        patron = crear_patron_parpadeo(500, 31)
+        libmetawear.mbl_mw_led_write_pattern(device.board, patron, LedColor.BLUE)
+        libmetawear.mbl_mw_led_play(device.board)
+        print("🔵 LED azul ENCENDIDO - Calculando offset")
+    except Exception as e:
+        print(f"Error LED azul: {e}")
+
+def prender_led_rojo(device):
+    """Prende LED rojo - Transmisión activa"""
+    try:
+        patron = crear_patron_parpadeo(200, 31)
+        libmetawear.mbl_mw_led_write_pattern(device.board, patron, LedColor.RED)
+        libmetawear.mbl_mw_led_play(device.board)
+        print("🔴 LED rojo ENCENDIDO - Transmisión activa")
+    except Exception as e:
+        print(f"Error LED rojo: {e}")
+
+def apagar_leds(device):
+    """Apaga todos los LEDs"""
+    try:
+        libmetawear.mbl_mw_led_stop_and_clear(device.board)
+        print("⚫ LEDs APAGADOS")
+    except Exception as e:
+        print(f"Error apagando LEDs: {e}")
+
+# ==========================
+#  Filtro complementario
+# ==========================
+class ComplementaryFilterWithPitchRollOffset:
     RAD2DEG = 180.0 / math.pi
 
     def __init__(self, alpha=0.98):
         self.alpha = float(alpha)
-        self.roll  = 0.0  # rad
-        self.pitch = 0.0  # rad
-        self.init  = False
-        # Bias simple de gyro (promedio inicial)
-        self._bx = 0.0
-        self._by = 0.0
-        self._n_bias = 0
+        self.roll = 0.0
+        self.pitch = 0.0
+        self.init = False
+        self.pitch_offset = 0.0
+        self.roll_offset = 0.0
+        self.offset_calculado = False
+        self.muestras_pitch_roll = []
 
     def _acc_angles_classic(self, ax, ay, az):
-        eps = 1e-9
-        roll_acc  = math.atan(  ay / max(eps, sqrt(ax*ax + az*az)) )
-        pitch_acc = math.atan( -ax / max(eps, sqrt(ay*ay + az*az)) )
+        """Calcula pitch y roll a partir del acelerómetro"""
+        roll_acc = math.atan2(ay, sqrt(ax*ax + az*az))
+        pitch_acc = math.atan2(-ax, sqrt(ay*ay + az*az))
         return roll_acc, pitch_acc
 
-    def update(self, ax_g, ay_g, az_g, gx_dps, gy_dps, dt_s):
-        # gyro: dps -> rad/s
-        gx = math.radians(gx_dps)
-        gy = math.radians(gy_dps)
+    def calcular_angulos_instantaneos(self, ax_g, ay_g, az_g):
+        """Calcula pitch y roll instantáneos solo con acelerómetro"""
+        roll_acc, pitch_acc = self._acc_angles_classic(ax_g, ay_g, az_g)
+        pitch_deg = -pitch_acc * self.RAD2DEG
+        roll_deg = roll_acc * self.RAD2DEG
+        return pitch_deg, roll_deg
 
-        # Ángulos por acelerómetro (clásico)
+    def agregar_muestra_offset(self, ax_g, ay_g, az_g):
+        """Agrega muestras para calcular offset de pitch y roll"""
+        pitch_inst, roll_inst = self.calcular_angulos_instantaneos(ax_g, ay_g, az_g)
+        self.muestras_pitch_roll.append((pitch_inst, roll_inst))
+
+    def calcular_offset_pitch_roll(self):
+        """Calcula el offset promedio de pitch y roll"""
+        if not self.muestras_pitch_roll:
+            return False
+        
+        sum_pitch = 0.0
+        sum_roll = 0.0
+        for pitch, roll in self.muestras_pitch_roll:
+            sum_pitch += pitch
+            sum_roll += roll
+        
+        n = len(self.muestras_pitch_roll)
+        self.pitch_offset = sum_pitch / n
+        self.roll_offset = sum_roll / n
+        self.offset_calculado = True
+        
+        print(f"🔧 OFFSET: Pitch={self.pitch_offset:.2f}°, Roll={self.roll_offset:.2f}° (muestras: {n})")
+        return True
+
+    def aplicar_offset_pitch_roll(self, pitch_deg, roll_deg):
+        """Aplica offset a los ángulos"""
+        if self.offset_calculado:
+            return pitch_deg - self.pitch_offset, roll_deg - self.roll_offset
+        return pitch_deg, roll_deg
+
+    def update(self, ax_g, ay_g, az_g, gx_dps, gy_dps, dt_s):
+        # Convertir giroscopio
+        gx_rad = math.radians(gx_dps)
+        gy_rad = math.radians(gy_dps)
+
+        # Calcular ángulos del acelerómetro
         roll_acc, pitch_acc = self._acc_angles_classic(ax_g, ay_g, az_g)
 
+        # Inicializar filtro
         if not self.init:
             self.roll, self.pitch = roll_acc, pitch_acc
             self.init = True
-            # arranque de bias
-            self._n_bias = 1
-            self._bx = gx
-            self._by = gy
-        elif self._n_bias < 50:  # ~0.5 s si dt=10 ms
-            self._n_bias += 1
-            self._bx += (gx - self._bx)/self._n_bias
-            self._by += (gy - self._by)/self._n_bias
 
-        # Integración del gyro (restando bias)
-        roll_gyro  = self.roll  + (gx - self._bx)*dt_s
-        pitch_gyro = self.pitch + (gy - self._by)*dt_s
+        # Integrar giroscopio
+        roll_gyro = self.roll + gx_rad * dt_s
+        pitch_gyro = self.pitch + gy_rad * dt_s
 
+        # Filtro complementario
         a = self.alpha
-        self.roll  = a*roll_gyro  + (1.0-a)*roll_acc
-        self.pitch = a*pitch_gyro + (1.0-a)*pitch_acc
+        self.roll = a * roll_gyro + (1.0 - a) * roll_acc
+        self.pitch = a * pitch_gyro + (1.0 - a) * pitch_acc
 
-        return (-self.pitch*self.RAD2DEG, self.roll*self.RAD2DEG)  # deg
+        # Convertir a grados y aplicar offset
+        pitch_deg = -self.pitch * self.RAD2DEG
+        roll_deg = self.roll * self.RAD2DEG
+        
+        return self.aplicar_offset_pitch_roll(pitch_deg, roll_deg)
 
 # ==========================
-#  Callbacks BLE (MetaWear)
+#  Comunicación UART
+# ==========================
+def uart_send_json(data_dict):
+    if arduino_serial and arduino_serial.is_open:
+        try:
+            json_str = json.dumps(data_dict)
+            arduino_serial.write((json_str + "\n").encode('utf-8'))
+            return True
+        except Exception as e:
+            return False
+    return False
+
+def uart_receive_telemetry():
+    if not arduino_serial or not arduino_serial.is_open:
+        return None
+    try:
+        if arduino_serial.in_waiting > 0:
+            line = arduino_serial.readline().decode('utf-8', errors='ignore').strip()
+            if line and line.startswith('{') and line.endswith('}'):
+                return json.loads(line)
+    except:
+        pass
+    return None
+
+def uart_receiver_thread():
+    telemetry_count = 0
+    while True:
+        telemetry = uart_receive_telemetry()
+        if telemetry:
+            telemetry_count += 1
+            with _telemetry_lock:
+                latest_telemetry.update(telemetry)
+        time.sleep(0.01)
+
+# ==========================
+#  Callbacks BLE - MEJORADAS
 # ==========================
 class State:
     def __init__(self, device):
         self.device = device
-        self.accCallback  = FnVoid_VoidP_DataP(self.acc_handler)
+        self.accCallback = FnVoid_VoidP_DataP(self.acc_handler)
         self.gyroCallback = FnVoid_VoidP_DataP(self.gyro_handler)
+        self.acc_count = 0
+        self.gyro_count = 0
 
     def acc_handler(self, ctx, data):
         try:
-            acc = parse_value(data)  # g
+            acc = parse_value(data)
             with _data_lock:
-                # Remapeo: X=frente, Y=izq, Z=arriba
                 latest_acc["x"] = -acc.z
                 latest_acc["y"] = +acc.y
                 latest_acc["z"] = -acc.x
-            _have_first_samples.set()
+            self.acc_count += 1
+            if not _have_first_samples.is_set():
+                _have_first_samples.set()
+                print(f"✅ Primer dato ACC recibido (count: {self.acc_count})")
         except Exception as e:
-            print("[ACC] Error:", e)
+            print(f"[ACC] Error: {e}")
 
     def gyro_handler(self, ctx, data):
         try:
-            gyro = parse_value(data)  # dps
+            gyro = parse_value(data)
             with _data_lock:
-                latest_gyro["x"] =  gyro.z
+                latest_gyro["x"] = gyro.z
                 latest_gyro["y"] = -gyro.y
-                latest_gyro["z"] =  gyro.x
-            _have_first_samples.set()
+                latest_gyro["z"] = gyro.x
+            self.gyro_count += 1
+            if not _have_first_samples.is_set():
+                _have_first_samples.set()
+                print(f"✅ Primer dato GYRO recibido (count: {self.gyro_count})")
         except Exception as e:
-            print("[GYRO] Error:", e)
+            print(f"[GYRO] Error: {e}")
 
 # ==========================
 #  BLE helpers
 # ==========================
-def connect_con_intentos(mac, tries=4, base_delay=1.2):
-    last = None
+def connect_con_intentos(mac, tries=10, base_delay=0.2):
     for i in range(1, tries+1):
         dev = MetaWear(mac)
         try:
             print(f"[BLE] Conectando a {mac} (intento {i}/{tries})...")
             dev.connect()
-            time.sleep(0.8)
-            print("[BLE] Conectado.")
+            time.sleep(2.0)  # Más tiempo para estabilizar
+            print("✅ BLE Conectado correctamente")
             return dev
         except WarbleException as e:
-            last = e
-            print("[BLE] Falló, reintentando...")
-            try: libmetawear.mbl_mw_debug_disconnect(dev.board)
-            except: pass
-            try: dev.disconnect()
-            except: pass
-            time.sleep(base_delay*i)
-    raise last or RuntimeError("No se pudo conectar BLE")
+            print(f"[BLE] Falló intento {i}: {e}")
+            try: 
+                dev.disconnect()
+            except: 
+                pass
+            if i < tries:
+                time.sleep(base_delay * i)
+    raise RuntimeError("No se pudo conectar BLE después de todos los intentos")
 
 # ==========================
-#  Loop a dt fijo (envío UART cada DT)
+#  Secuencia de inicialización MEJORADA
 # ==========================
-def run_filter_fixed_dt_and_uart():
-    filt = ComplementaryFilterClassic(alpha=ALPHA)
-
-    dt_s = DT_MS / 1000.0
-    next_t = time.perf_counter()
-    last_print = time.perf_counter()
-
-    print(f"\n[FILTRO clásico] dt={DT_MS} ms | alpha={ALPHA:.3f}")
-    print("Enviando por UART: ANGLES_RPI,pitch_deg=...,roll_deg=...,alpha=...,dt_ms=...\n")
-
-    while True:
-        # Tomar última muestra disponible
+def secuencia_inicializacion(device, filtro):
+    print("\n" + "="*50)
+    print("INICIANDO SECUENCIA DE INICIALIZACIÓN")
+    print("="*50)
+    
+    # 1. LED verde - Conexión exitosa
+    print("🟢 PASO 1: Conexión exitosa")
+    prender_led_verde(device)
+    time.sleep(2.0)
+    apagar_leds(device)
+    time.sleep(0.5)
+    
+    # 2. Esperar datos del sensor CON MÁS TIEMPO Y DEBUG
+    print("⏳ Esperando datos del sensor...")
+    print("   Verificando recepción de datos...")
+    
+    start_wait = time.time()
+    while time.time() - start_wait < 10.0:  # 10 segundos de espera
         with _data_lock:
-            ax = latest_acc["x"]; ay = latest_acc["y"]; az = latest_acc["z"]
-            gx = latest_gyro["x"]; gy = latest_gyro["y"]
+            acc_norm = sqrt(latest_acc["x"]**2 + latest_acc["y"]**2 + latest_acc["z"]**2)
+            gyro_norm = sqrt(latest_gyro["x"]**2 + latest_gyro["y"]**2 + latest_gyro["z"]**2)
+        
+        # Mostrar estado cada 2 segundos
+        if int(time.time() - start_wait) % 2 == 0:
+            print(f"   Esperando... ACC: {acc_norm:.3f}g, GYRO: {gyro_norm:.3f} dps")
+        
+        # Si tenemos datos válidos, continuar
+        if acc_norm > 0.5 and acc_norm < 2.0:  # Entre 0.5g y 2.0g (rango razonable)
+            print(f"✅ Datos del sensor recibidos correctamente")
+            print(f"   ACC: [{latest_acc['x']:.3f}, {latest_acc['y']:.3f}, {latest_acc['z']:.3f}] g")
+            print(f"   GYRO: [{latest_gyro['x']:.3f}, {latest_gyro['y']:.3f}, {latest_gyro['z']:.3f}] dps")
+            break
+        
+        time.sleep(0.5)
+    else:
+        print("❌ TIMEOUT: No se recibieron datos válidos del sensor")
+        print("   Verifica:")
+        print("   - Que el sensor MetaWear esté encendido")
+        print("   - Que la batería esté cargada")
+        print("   - Que esté cerca de la Raspberry Pi")
+        return False
+    
+    # 3. LED azul - Calibración
+    print("🔵 PASO 2: Calibrando offset...")
+    print("   ⚠️  Mantén el sensor plano y quieto")
+    prender_led_azul(device)
+    
+    print("   Tomando 100 muestras (2 segundos)...")
+    muestras = 0
+    start_cal = time.time()
+    
+    while time.time() - start_cal < 2.0:
+        with _data_lock:
+            ax, ay, az = latest_acc["x"], latest_acc["y"], latest_acc["z"]
+        
+        filtro.agregar_muestra_offset(ax, ay, az)
+        muestras += 1
+        time.sleep(0.02)
+    
+    if not filtro.calcular_offset_pitch_roll():
+        print("❌ Error en calibración")
+        return False
+    
+    apagar_leds(device)
+    time.sleep(0.5)
+    
+    # Verificar calibración
+    with _data_lock:
+        ax, ay, az = latest_acc["x"], latest_acc["y"], latest_acc["z"]
+    
+    pitch_orig, roll_orig = filtro.calcular_angulos_instantaneos(ax, ay, az)
+    pitch_corr, roll_corr = filtro.aplicar_offset_pitch_roll(pitch_orig, roll_orig)
+    
+    print(f"✅ Calibración completada:")
+    print(f"   Original:  Pitch={pitch_orig:6.2f}°, Roll={roll_orig:6.2f}°")
+    print(f"   Corregido: Pitch={pitch_corr:6.2f}°, Roll={roll_corr:6.2f}°")
+    
+    return True
 
-        pitch_deg, roll_deg = filt.update(ax, ay, az, gx, gy, dt_s)
-
-        # Envío UART cada DT
-        uart_send(
-            "ANGLES_RPI,pitch_deg={:.2f},roll_deg={:.2f},alpha={:.3f},dt_ms={:.1f}"
-            .format(pitch_deg, roll_deg, ALPHA, DT_MS)
-        )
-
-        # Print cada PRINT_MS
-        now = time.perf_counter()
-        if (now - last_print) >= (PRINT_MS/1000.0):
-            last_print = now
-            print("pitch={:+7.2f}°, roll={:+7.2f}°  |  alpha={:.2f}, dt={} ms"
-                  .format(pitch_deg, roll_deg, ALPHA, DT_MS))
-
-        # Mantener dt fijo
-        next_t += dt_s
-        sleep_time = next_t - time.perf_counter()
-        if sleep_time > 0:
-            time.sleep(sleep_time)
-        else:
-            next_t = time.perf_counter()
+# ==========================
+#  Loop principal
+# ==========================
+def run_filter_continuous(filtro, device):
+    print("\n🎯 INICIANDO TRANSMISIÓN")
+    print("   📤 Enviando ángulos a Arduino")
+    print("   📥 Recibiendo telemetría")
+    
+    prender_led_rojo(device)
+    
+    # Iniciar hilo receptor
+    receiver_thread = threading.Thread(target=uart_receiver_thread, daemon=True)
+    receiver_thread.start()
+    
+    last_print = time.time()
+    angle_count = 0
+    last_angle_time = 0
+    
+    # Variables para almacenar últimos ángulos
+    last_pitch, last_roll = 0.0, 0.0
+    
+    try:
+        while True:
+            current_time = time.time()
+            
+            # Enviar ángulos cada 10ms
+            if current_time - last_angle_time >= 0.01:
+                with _data_lock:
+                    ax, ay, az = latest_acc["x"], latest_acc["y"], latest_acc["z"]
+                    gx, gy = latest_gyro["x"], latest_gyro["y"]
+                
+                # Solo procesar si tenemos datos válidos
+                if abs(ax) + abs(ay) + abs(az) > 0.1:
+                    pitch, roll = filtro.update(ax, ay, az, gx, gy, 0.01)
+                    last_pitch, last_roll = pitch, roll
+                    
+                    if uart_send_json({"pitch": round(pitch, 2), "roll": round(roll, 2)}):
+                        angle_count += 1
+                
+                last_angle_time = current_time
+            
+            # Mostrar estado cada 500ms
+            if current_time - last_print >= 0.5:
+                with _telemetry_lock:
+                    pwm_izq = latest_telemetry.get('pwm_izq', 0)
+                    pwm_der = latest_telemetry.get('pwm_der', 0)
+                    modo = latest_telemetry.get('modo', 'SIN DATOS')
+                
+                print(f"📐 Pitch{last_pitch:+6.1f}° Roll{last_roll:+6.1f}° | "
+                      f"⚡ [{pwm_izq:4d},{pwm_der:4d}] | 🎮 {modo:10} | 📤 {angle_count}")
+                last_print = current_time
+            
+            time.sleep(0.001)
+            
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        raise
 
 # ==========================
 #  MAIN
 # ==========================
 def main():
-    # Conectar BLE + configurar sensores
-    device = connect_con_intentos(SENSOR_MAC, tries=4)
+    print("🚀 SISTEMA RASPBERRY PI + METAWEAR + ARDUINO")
+    print("=============================================")
+    
+    # Conectar a MetaWear
+    device = connect_con_intentos(SENSOR_MAC, tries=10)
     state = State(device)
 
-    print("[BLE] Configurando...")
+    print("\n[BLE] Configurando sensores...")
+    
+    # Configurar parámetros de conexión
     libmetawear.mbl_mw_settings_set_connection_parameters(device.board, 7.5, 7.5, 0, 6000)
-    sleep(1.0)
-
-    # Acelerómetro 50 Hz, ±4g
+    time.sleep(1.0)
+    
+    # Configurar acelerómetro
+    print("   Configurando acelerómetro...")
     libmetawear.mbl_mw_acc_bmi160_set_odr(device.board, AccBmi160Odr._50Hz)
     libmetawear.mbl_mw_acc_bosch_set_range(device.board, AccBoschRange._4G)
     libmetawear.mbl_mw_acc_write_acceleration_config(device.board)
-
-    # Giroscopio 50 Hz, ±1000 dps
+    
+    # Configurar giroscopio
+    print("   Configurando giroscopio...")
     libmetawear.mbl_mw_gyro_bmi160_set_range(device.board, GyroBoschRange._1000dps)
     libmetawear.mbl_mw_gyro_bmi160_set_odr(device.board, GyroBoschOdr._50Hz)
     libmetawear.mbl_mw_gyro_bmi160_write_config(device.board)
-
-    # Señales y suscripciones
-    acc_signal  = libmetawear.mbl_mw_acc_get_acceleration_data_signal(device.board)
+    
+    # Obtener señales
+    acc_signal = libmetawear.mbl_mw_acc_get_acceleration_data_signal(device.board)
     gyro_signal = libmetawear.mbl_mw_gyro_bmi160_get_rotation_data_signal(device.board)
-
+    
+    # Suscribirse
+    print("   Suscribiendo a señales...")
     libmetawear.mbl_mw_datasignal_subscribe(acc_signal, None, state.accCallback)
     libmetawear.mbl_mw_datasignal_subscribe(gyro_signal, None, state.gyroCallback)
-
-    # Start
+    
+    # Iniciar sensores
+    print("   Iniciando sensores...")
     libmetawear.mbl_mw_acc_enable_acceleration_sampling(device.board)
     libmetawear.mbl_mw_acc_start(device.board)
     libmetawear.mbl_mw_gyro_bmi160_enable_rotation_sampling(device.board)
     libmetawear.mbl_mw_gyro_bmi160_start(device.board)
-
-    print("[RUN] Esperando primeras muestras...")
-    _have_first_samples.wait(timeout=2.0)
-    print("[RUN] Filtro clásico + UART. Ctrl+C para salir.")
+    
+    print("✅ Sensores configurados e iniciados")
+    
+    # Inicializar filtro
+    filtro = ComplementaryFilterWithPitchRollOffset(alpha=ALPHA)
+    
+    # Secuencia de inicialización
+    if not secuencia_inicializacion(device, filtro):
+        print("❌ Falló la inicialización")
+        apagar_leds(device)
+        libmetawear.mbl_mw_acc_stop(device.board)
+        libmetawear.mbl_mw_gyro_bmi160_stop(device.board)
+        device.disconnect()
+        return
+    
+    print("\n🎯 SISTEMA LISTO")
+    print("   Presiona Ctrl+C para salir")
+    print("=" * 50)
 
     try:
-        run_filter_fixed_dt_and_uart()
+        run_filter_continuous(filtro, device)
     except KeyboardInterrupt:
-        print("\n[STOP] Deteniendo y cerrando...")
+        print("\n🛑 Deteniendo...")
     finally:
-        # Parar sensores y limpiar
+        print("\n🔧 Limpiando recursos...")
+        apagar_leds(device)
         libmetawear.mbl_mw_acc_stop(device.board)
-        libmetawear.mbl_mw_acc_disable_acceleration_sampling(device.board)
         libmetawear.mbl_mw_gyro_bmi160_stop(device.board)
-        libmetawear.mbl_mw_gyro_bmi160_disable_rotation_sampling(device.board)
         libmetawear.mbl_mw_datasignal_unsubscribe(acc_signal)
         libmetawear.mbl_mw_datasignal_unsubscribe(gyro_signal)
         device.disconnect()
-
         if arduino_serial:
-            try:
-                arduino_serial.close()
-            except: pass
-
-        print("[OK] Desconectado correctamente.")
+            arduino_serial.close()
+        print("✅ Sistema desconectado")
 
 if __name__ == "__main__":
     main()
