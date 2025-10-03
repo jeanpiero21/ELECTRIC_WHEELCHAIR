@@ -1,0 +1,330 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+#include <ArduinoJson.h>
+
+/* =============== CONFIGURACIÓN =============== */
+// Sentido de ejes (ajusta si se invierten en tu montaje):
+const int SIGN_PITCH = +1;   // +1 adelante, -1 invertir
+const int SIGN_ROLL  = +1;   // +1 derecha,  -1 invertir
+
+// Calibración de offset (muestras a promediar tras encender):
+const float DEAD_PITCH_DEG = 10.0f;
+const float DEAD_ROLL_DEG  = 10.0f;
+const int   PWM_MAX_CMD    = 160;     // saturador ±40
+
+// Ganancias abiertas (PWM por grado útil)
+const float KP_PITCH_FWD = 0.8f;  // adelante
+const float KP_PITCH_REV = 1.5f;  // atrás
+const float KP_ROLL      = 1.2f;  // (igual que antes)
+
+/* ===== Pines IBT-2 IZQUIERDO ===== */
+const int L_RPWM = 5;   // PWM
+const int L_LPWM = 6;   // PWM
+const int L_REN  = 7;   // enable
+const int L_LEN  = 8;   // enable
+
+/* ===== Pines IBT-2 DERECHO ===== */
+const int R_RPWM = 9;   // PWM
+const int R_LPWM = 10;  // PWM
+const int R_REN  = 11;  // enable
+const int R_LEN  = 12;  // enable
+
+// LED de estado
+const int ledPin = 13;
+
+// ====== Drivers IBT-2 ======
+int lastL = 0, lastR = 0;  // último PWM enviado (para detectar inversión)
+// invertir de sentido
+const uint16_t REVERSE_DEADTIME_MS = 30;  // pausa breve al invertir
+const int      MIN_PWM_TO_REVERSE   = 8; // si superas esto, aplica pausa antes de invertir
+
+// Limitar cambio por ciclo (suavizado)
+const int PWM_SLEW = 8;
+
+/* =============== VARIABLES =============== */
+
+// Comandos
+int pwm_base = 0;    // avance/retro (de pitch)
+int pwm_steer = 0;   // giro (de roll)
+int pwm_L = 0, pwm_R = 0;        // para cada driver
+int outL = 0, outR = 0;          // con rampa (suavizado)
+
+// Tiempo último comando
+unsigned long lastCommandTime = 0;
+const unsigned long COMMAND_TIMEOUT_MS = 1000; // 1 segundo timeout
+
+// Tiempo último envío de telemetría
+unsigned long lastTelemetryTime = 0;
+const unsigned long TELEMETRY_INTERVAL_MS = 200; // 200ms entre envíos
+
+// Estado del sistema
+bool systemActive = false;
+unsigned long systemStartTime = 0;
+
+void motoresWrite(int velL, int velR);
+
+/* =============== HELPERS =============== */
+static inline int sgn(int v){ return (v>0)-(v<0); }
+
+int applySlew(int current, int target){
+  if (current < target){ 
+    current += PWM_SLEW; 
+    if (current > target) current = target; 
+  }
+  else if (current > target){ 
+    current -= PWM_SLEW; 
+    if (current < target) current = target; 
+  }
+  return current;
+}
+
+float deadbandSigned(float x_deg, float dead_deg){
+  float a = fabs(x_deg);
+  if (a <= dead_deg) return 0.0f;
+  return (x_deg > 0.0f) ? (a - dead_deg) : -(a - dead_deg);
+}
+
+int saturatePWM(int v){
+  if (v >  PWM_MAX_CMD) return  PWM_MAX_CMD;
+  if (v < -PWM_MAX_CMD) return -PWM_MAX_CMD;
+  return v;
+}
+
+// --- Telemetría hacia la Raspberry ---
+const int DIR_DEAD_PWM = 3;   // umbral para considerar "casi cero" al decidir la etiqueta
+
+const char* direccionTexto(int base_pwm, int steer_pwm) {
+  // base = avance/retro ; steer = giro (signo dado por SIGN_ROLL)
+  int ab = abs(base_pwm), as = abs(steer_pwm);
+  if (ab < DIR_DEAD_PWM && as < DIR_DEAD_PWM) return "NEUTRO";
+  if (ab >= as) return (base_pwm >= 0) ? "ADELANTE" : "ATRAS";
+  // si no hay avance/retro, decidir por giro
+  return (steer_pwm >= 0) ? "DERECHA" : "IZQUIERDA";
+}
+
+/* =============== LÓGICA PRINCIPAL =============== */
+void procesarAngulos(float p_deg_in, float r_deg_in) {
+  // Aplicar signos de configuración
+  float p_deg = p_deg_in * SIGN_PITCH;
+  float r_deg = r_deg_in * SIGN_ROLL;
+
+  // Aplica zona muerta independiente
+  float p_eff = deadbandSigned(p_deg, DEAD_PITCH_DEG);
+  float r_eff = deadbandSigned(r_deg,  DEAD_ROLL_DEG);
+
+  // Control abierto: pwm = Kp * ángulo útil (saturado)
+  float kp_pitch = (p_eff >= 0.0f) ? KP_PITCH_FWD : KP_PITCH_REV;
+  pwm_base = saturatePWM((int) roundf(kp_pitch * p_eff));
+  
+  pwm_steer = saturatePWM( (int) roundf(KP_ROLL  * r_eff) );
+
+  // Mezcla diferencial (adelante/atrás con giro)
+  pwm_L = saturatePWM(pwm_base - pwm_steer);
+  pwm_R = saturatePWM(pwm_base + pwm_steer);
+
+  // Rampa suave (opcional, para no dar golpes)
+  outL = applySlew(outL, pwm_L);
+  outR = applySlew(outR, pwm_R);
+  
+  // Enviar a motores
+  motoresWrite(outL, outR);
+
+  // Actualizar tiempo del último comando
+  lastCommandTime = millis();
+  systemActive = true;
+}
+
+// ====== Drivers IBT-2 ======
+void ibt2WriteOne(int rpwmPin, int lpwmPin, int renPin, int lenPin,
+                  int speed, int &lastSpeed)
+{
+  int signNow  = (speed>0) - (speed<0);
+  int signPrev = (lastSpeed>0) - (lastSpeed<0);
+
+  // Inversión segura: si cambia el signo y venías "rápido", primero "coast"
+  if (signNow != 0 && signPrev != 0 &&
+      signNow != signPrev && abs(lastSpeed) > MIN_PWM_TO_REVERSE) {
+    analogWrite(rpwmPin, 0);
+    analogWrite(lpwmPin, 0);
+    digitalWrite(renPin, LOW);
+    digitalWrite(lenPin, LOW);
+    delay(REVERSE_DEADTIME_MS);
+  }
+
+  // Escala ±PWM_MAX_CMD -> 0..255 del IBT-2
+  int pwmAbs  = abs(speed);
+  if (pwmAbs > PWM_MAX_CMD) pwmAbs = PWM_MAX_CMD;
+  int pwmByte = map(pwmAbs, 0, PWM_MAX_CMD, 0, 255);
+
+  if (pwmByte == 0) {
+    // Coasting/parado
+    analogWrite(rpwmPin, 0);
+    analogWrite(lpwmPin, 0);
+    digitalWrite(renPin, LOW);
+    digitalWrite(lenPin, LOW);
+  } else if (speed > 0) {
+    // Adelante: RPWM con PWM, LPWM a 0
+    digitalWrite(renPin, HIGH);
+    digitalWrite(lenPin, HIGH);
+    analogWrite(rpwmPin, pwmByte);
+    analogWrite(lpwmPin, 0);
+  } else {
+    // Atrás: LPWM con PWM, RPWM a 0
+    digitalWrite(renPin, HIGH);
+    digitalWrite(lenPin, HIGH);
+    analogWrite(rpwmPin, 0);
+    analogWrite(lpwmPin, pwmByte);
+  }
+
+  lastSpeed = speed;
+}
+
+void motoresWrite(int velL, int velR){
+  ibt2WriteOne(L_RPWM, L_LPWM, L_REN, L_LEN, velL, lastL);
+  ibt2WriteOne(R_RPWM, R_LPWM, R_REN, R_LEN, velR, lastR);
+}
+
+// Función para enviar telemetría a Raspberry Pi
+void enviarTelemetria() {
+  StaticJsonDocument<200> doc;
+  
+  doc["pwm_izq"] = outL;
+  doc["pwm_der"] = outR;
+  doc["modo"] = direccionTexto(pwm_base, pwm_steer);
+  doc["timestamp"] = millis();
+  doc["activo"] = systemActive;
+  
+  String output;
+  serializeJson(doc, output);
+  Serial.println(output);
+}
+
+// Función para parada de seguridad por timeout
+void seguridadTimeout() {
+  if (millis() - lastCommandTime > COMMAND_TIMEOUT_MS) {
+    // Timeout - parar motores
+    outL = 0;
+    outR = 0;
+    motoresWrite(0, 0);
+    systemActive = false;
+    
+    // Parpadear LED rápido indicando timeout
+    digitalWrite(ledPin, (millis() % 200) < 100);
+  }
+}
+
+// Función para controlar envío de telemetría cada 200ms
+void controlTelemetria() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastTelemetryTime >= TELEMETRY_INTERVAL_MS) {
+    enviarTelemetria();
+    lastTelemetryTime = currentTime;
+  }
+}
+
+// Procesar comando JSON desde Raspberry Pi
+void procesarComandoJSON(const String& jsonString) {
+  StaticJsonDocument<200> doc;
+  DeserializationError error = deserializeJson(doc, jsonString);
+  
+  if (error) {
+    Serial.print("❌ JSON error: ");
+    Serial.println(error.c_str());
+    return;
+  }
+  
+  // Verificar que tenemos los campos necesarios
+  if (!doc.containsKey("pitch") || !doc.containsKey("roll")) {
+    Serial.println("❌ JSON missing pitch/roll");
+    return;
+  }
+  
+  // Extraer ángulos
+  float pitch = doc["pitch"];
+  float roll = doc["roll"];
+  
+  // Procesar ángulos y controlar motores
+  procesarAngulos(pitch, roll);
+  
+  // LED indicador de actividad
+  digitalWrite(ledPin, HIGH);
+}
+
+// Leer datos serial de Raspberry Pi
+void leerSerialRaspberry() {
+  while (Serial.available()) {
+    String jsonString = Serial.readStringUntil('\n');
+    jsonString.trim();
+    
+    if (jsonString.length() > 0) {
+      procesarComandoJSON(jsonString);
+    }
+  }
+}
+
+// Mostrar estado por Serial (debug)
+void mostrarEstadoDebug() {
+  static unsigned long lastDebug = 0;
+  if (millis() - lastDebug >= 1000) {
+    lastDebug = millis();
+    
+    Serial.print("🔧 DEBUG | L:");
+    Serial.print(outL);
+    Serial.print(" R:");
+    Serial.print(outR);
+    Serial.print(" | Modo:");
+    Serial.print(direccionTexto(pwm_base, pwm_steer));
+    Serial.print(" | Activo:");
+    Serial.println(systemActive ? "SI" : "NO");
+  }
+}
+
+/* =============== SETUP / LOOP =============== */
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(5);
+  
+  // Configurar pines de motores
+  pinMode(L_RPWM, OUTPUT); pinMode(L_LPWM, OUTPUT);
+  pinMode(L_REN,  OUTPUT); pinMode(L_LEN,  OUTPUT);
+  pinMode(R_RPWM, OUTPUT); pinMode(R_LPWM, OUTPUT);
+  pinMode(R_REN,  OUTPUT); pinMode(R_LEN,  OUTPUT);
+  pinMode(ledPin, OUTPUT);
+
+  // Arranque en coasting (motores parados y disables en LOW)
+  analogWrite(L_RPWM,0); analogWrite(L_LPWM,0);
+  analogWrite(R_RPWM,0); analogWrite(R_LPWM,0);
+  digitalWrite(L_REN,LOW); digitalWrite(L_LEN,LOW);
+  digitalWrite(R_REN,LOW); digitalWrite(R_LEN,LOW);
+
+  // LED indicador de encendido
+  digitalWrite(ledPin, HIGH);
+  delay(500);
+  digitalWrite(ledPin, LOW);
+  
+  // Inicializar timer de telemetría
+  lastTelemetryTime = millis();
+  systemStartTime = millis();
+  
+  Serial.println("🚀 ARDUINO INICIADO - Esperando datos IMU...");
+  Serial.println("📤 Enviando telemetría cada 200ms");
+  Serial.println("----------------------------------------");
+}
+
+void loop() {
+  // Leer comandos JSON de Raspberry Pi
+  leerSerialRaspberry();
+  
+  // Controlar envío de telemetría cada 200ms
+  controlTelemetria();
+  
+  // Verificar timeout de seguridad
+  seguridadTimeout();
+  
+  // Mostrar estado debug cada segundo
+  //mostrarEstadoDebug();
+  
+  delay(10); // Pequeña pausa para estabilidad
