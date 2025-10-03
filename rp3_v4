@@ -39,14 +39,14 @@ for port in SERIAL_PORTS:
         arduino_serial = serial.Serial(port, BAUD, timeout=0.1)
         arduino_serial.flushInput()
         arduino_serial.flushOutput()
-        print(f"✅ UART OK en {port} @{BAUD}")
+        print(f"UART OK en {port} @{BAUD}")
         break
     except Exception as e:
-        print(f"❌ No se pudo abrir {port}: {e}")
+        print(f"No se pudo abrir {port}: {e}")
         continue
 
 if arduino_serial is None:
-    print("⚠️  No se pudo conectar con Arduino, funcionando en modo solo IMU")
+    print("No se pudo conectar con Arduino, funcionando en modo solo IMU")
 
 # ==========================
 #  Buffers compartidos y telemetría
@@ -94,7 +94,7 @@ def prender_led_verde(device):
         patron = crear_patron_solido(2000, 31, 1)
         libmetawear.mbl_mw_led_write_pattern(device.board, patron, LedColor.GREEN)
         libmetawear.mbl_mw_led_play(device.board)
-        print("🟢 LED verde ENCENDIDO - Conexión exitosa")
+        print("LED verde ENCENDIDO - Conexión exitosa")
     except Exception as e:
         print(f"Error LED verde: {e}")
 
@@ -104,7 +104,7 @@ def prender_led_azul(device):
         patron = crear_patron_parpadeo(500, 31)
         libmetawear.mbl_mw_led_write_pattern(device.board, patron, LedColor.BLUE)
         libmetawear.mbl_mw_led_play(device.board)
-        print("🔵 LED azul ENCENDIDO - Calculando offset")
+        print("LED azul ENCENDIDO - Calculando offset")
     except Exception as e:
         print(f"Error LED azul: {e}")
 
@@ -114,7 +114,7 @@ def prender_led_rojo(device):
         patron = crear_patron_parpadeo(200, 31)
         libmetawear.mbl_mw_led_write_pattern(device.board, patron, LedColor.RED)
         libmetawear.mbl_mw_led_play(device.board)
-        print("🔴 LED rojo ENCENDIDO - Transmisión activa")
+        print("LED rojo ENCENDIDO - Transmisión activa")
     except Exception as e:
         print(f"Error LED rojo: {e}")
 
@@ -122,7 +122,7 @@ def apagar_leds(device):
     """Apaga todos los LEDs"""
     try:
         libmetawear.mbl_mw_led_stop_and_clear(device.board)
-        print("⚫ LEDs APAGADOS")
+        print("LEDs APAGADOS")
     except Exception as e:
         print(f"Error apagando LEDs: {e}")
 
@@ -269,7 +269,7 @@ class State:
             self.acc_count += 1
             if not _have_first_samples.is_set():
                 _have_first_samples.set()
-                print(f"✅ Primer dato ACC recibido (count: {self.acc_count})")
+                print(f" Primer dato ACC recibido (count: {self.acc_count})")
         except Exception as e:
             print(f"[ACC] Error: {e}")
 
@@ -283,7 +283,7 @@ class State:
             self.gyro_count += 1
             if not _have_first_samples.is_set():
                 _have_first_samples.set()
-                print(f"✅ Primer dato GYRO recibido (count: {self.gyro_count})")
+                print(f"Primer dato GYRO recibido (count: {self.gyro_count})")
         except Exception as e:
             print(f"[GYRO] Error: {e}")
 
@@ -297,7 +297,7 @@ def connect_con_intentos(mac, tries=10, base_delay=0.2):
             print(f"[BLE] Conectando a {mac} (intento {i}/{tries})...")
             dev.connect()
             time.sleep(2.0)  # Más tiempo para estabilizar
-            print("✅ BLE Conectado correctamente")
+            print("BLE Conectado correctamente")
             return dev
         except WarbleException as e:
             print(f"[BLE] Falló intento {i}: {e}")
@@ -318,7 +318,7 @@ def secuencia_inicializacion(device, filtro):
     print("="*50)
     
     # 1. LED verde - Conexión exitosa
-    print("🟢 PASO 1: Conexión exitosa")
+    print("PASO 1: Conexión exitosa")
     prender_led_verde(device)
     time.sleep(2.0)
     apagar_leds(device)
@@ -340,14 +340,14 @@ def secuencia_inicializacion(device, filtro):
         
         # Si tenemos datos válidos, continuar
         if acc_norm > 0.5 and acc_norm < 2.0:  # Entre 0.5g y 2.0g (rango razonable)
-            print(f"✅ Datos del sensor recibidos correctamente")
+            print(f"Datos del sensor recibidos correctamente")
             print(f"   ACC: [{latest_acc['x']:.3f}, {latest_acc['y']:.3f}, {latest_acc['z']:.3f}] g")
             print(f"   GYRO: [{latest_gyro['x']:.3f}, {latest_gyro['y']:.3f}, {latest_gyro['z']:.3f}] dps")
             break
         
         time.sleep(0.5)
     else:
-        print("❌ TIMEOUT: No se recibieron datos válidos del sensor")
+        print("TIMEOUT: No se recibieron datos válidos del sensor")
         print("   Verifica:")
         print("   - Que el sensor MetaWear esté encendido")
         print("   - Que la batería esté cargada")
@@ -355,8 +355,8 @@ def secuencia_inicializacion(device, filtro):
         return False
     
     # 3. LED azul - Calibración
-    print("🔵 PASO 2: Calibrando offset...")
-    print("   ⚠️  Mantén el sensor plano y quieto")
+    print("PASO 2: Calibrando offset...")
+    print("Mantén el sensor plano y quieto")
     prender_led_azul(device)
     
     print("   Tomando 100 muestras (2 segundos)...")
@@ -372,7 +372,7 @@ def secuencia_inicializacion(device, filtro):
         time.sleep(0.02)
     
     if not filtro.calcular_offset_pitch_roll():
-        print("❌ Error en calibración")
+        print("Error en calibración")
         return False
     
     apagar_leds(device)
@@ -385,7 +385,7 @@ def secuencia_inicializacion(device, filtro):
     pitch_orig, roll_orig = filtro.calcular_angulos_instantaneos(ax, ay, az)
     pitch_corr, roll_corr = filtro.aplicar_offset_pitch_roll(pitch_orig, roll_orig)
     
-    print(f"✅ Calibración completada:")
+    print(f"Calibración completada:")
     print(f"   Original:  Pitch={pitch_orig:6.2f}°, Roll={roll_orig:6.2f}°")
     print(f"   Corregido: Pitch={pitch_corr:6.2f}°, Roll={roll_corr:6.2f}°")
     
@@ -395,9 +395,9 @@ def secuencia_inicializacion(device, filtro):
 #  Loop principal
 # ==========================
 def run_filter_continuous(filtro, device):
-    print("\n🎯 INICIANDO TRANSMISIÓN")
-    print("   📤 Enviando ángulos a Arduino")
-    print("   📥 Recibiendo telemetría")
+    print("\nINICIANDO TRANSMISIÓN")
+    print("Enviando ángulos a Arduino")
+    print("Recibiendo telemetría")
     
     prender_led_rojo(device)
     
@@ -440,20 +440,20 @@ def run_filter_continuous(filtro, device):
                     modo = latest_telemetry.get('modo', 'SIN DATOS')
                 
                 print(f"📐 Pitch{last_pitch:+6.1f}° Roll{last_roll:+6.1f}° | "
-                      f"⚡ [{pwm_izq:4d},{pwm_der:4d}] | 🎮 {modo:10} | 📤 {angle_count}")
+                      f" [{pwm_izq:4d},{pwm_der:4d}] | {modo:10} |  {angle_count}")
                 last_print = current_time
             
             time.sleep(0.001)
             
     except Exception as e:
-        print(f"❌ Error: {e}")
+        print(f" Error: {e}")
         raise
 
 # ==========================
 #  MAIN
 # ==========================
 def main():
-    print("🚀 SISTEMA RASPBERRY PI + METAWEAR + ARDUINO")
+    print(" SISTEMA RASPBERRY PI + METAWEAR + ARDUINO")
     print("=============================================")
     
     # Conectar a MetaWear
@@ -494,28 +494,28 @@ def main():
     libmetawear.mbl_mw_gyro_bmi160_enable_rotation_sampling(device.board)
     libmetawear.mbl_mw_gyro_bmi160_start(device.board)
     
-    print("✅ Sensores configurados e iniciados")
+    print(" Sensores configurados e iniciados")
     
     # Inicializar filtro
     filtro = ComplementaryFilterWithPitchRollOffset(alpha=ALPHA)
     
     # Secuencia de inicialización
     if not secuencia_inicializacion(device, filtro):
-        print("❌ Falló la inicialización")
+        print("Falló la inicialización")
         apagar_leds(device)
         libmetawear.mbl_mw_acc_stop(device.board)
         libmetawear.mbl_mw_gyro_bmi160_stop(device.board)
         device.disconnect()
         return
     
-    print("\n🎯 SISTEMA LISTO")
+    print("\n SISTEMA LISTO")
     print("   Presiona Ctrl+C para salir")
     print("=" * 50)
 
     try:
         run_filter_continuous(filtro, device)
     except KeyboardInterrupt:
-        print("\n🛑 Deteniendo...")
+        print("\n Deteniendo...")
     finally:
         print("\n🔧 Limpiando recursos...")
         apagar_leds(device)
@@ -526,7 +526,7 @@ def main():
         device.disconnect()
         if arduino_serial:
             arduino_serial.close()
-        print("✅ Sistema desconectado")
+        print(" Sistema desconectado")
 
 if __name__ == "__main__":
     main()
